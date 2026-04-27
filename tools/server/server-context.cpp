@@ -163,7 +163,13 @@ struct server_slot {
 
         SLT_INF(*this, "clearing prompt with %zu tokens\n", prompt.tokens.size());
 
-        llama_memory_seq_rm(llama_get_memory(ctx), id, -1, -1);
+        // only try to remove the sequence if sequence removal is supported
+        // Mamba/GDN-based models (e.g. DeepSeek-V4-Flash) do not support this
+        if (common_context_can_seq_rm(ctx) != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+            if (!llama_memory_seq_rm(llama_get_memory(ctx), id, -1, -1)) {
+                SRV_WRN("%s", "the target context does not support partial sequence removal\n");
+            }
+        }
         prompt.tokens.clear();
     }
 
@@ -546,8 +552,13 @@ struct server_slot {
     void copy_state_to(server_slot & other) const {
         GGML_ASSERT(state == SLOT_STATE_DONE_PROMPT);
 
-        llama_memory_seq_rm(llama_get_memory(ctx), other.id,     -1, -1);
-        llama_memory_seq_cp(llama_get_memory(ctx), id, other.id, -1, -1);
+        const auto other_ctx_seq_rm_type = common_context_can_seq_rm(other.ctx);
+        if (other_ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+            llama_memory_seq_rm(llama_get_memory(ctx), other.id, -1, -1);
+        }
+        if (ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+            llama_memory_seq_cp(llama_get_memory(ctx), id, other.id, -1, -1);
+        }
 
         other.n_decoded   = n_decoded;
         other.n_remaining = n_remaining;
@@ -2649,37 +2660,21 @@ private:
                         slot.n_prompt_tokens_processed++;
 
                         // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
-                        // create checkpoints in the tail of the prompt:
+                        // create checkpoints that many tokens before the end of the prompt:
                         //  - 4 + n_ubatch
-                        //  - SWA-spaced offsets down to 4 + n_swa
                         //  - 4
-                        // The SWA-spaced checkpoints are useful for hybrid/recurrent models that cannot partially
-                        // erase the tail cache state. They avoid falling back to an ubatch-old checkpoint when only
-                        // a sliding-window tail plus the previous generation needs to be replayed.
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
                         if (do_checkpoint) {
+                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+
                             bool should_break = false;
-
-                            auto should_checkpoint_tail = [&](int offset) {
+                            for (int offset : checkpoint_offsets) {
                                 const int n_last = std::min(n_batch, offset);
-                                return slot.task->n_tokens() == slot.prompt.n_tokens() + n_last;
-                            };
-
-                            if (should_checkpoint_tail(4 + n_ubatch)) {
-                                should_break = true;
-                            } else if (n_swa > 0 && n_swa < n_ubatch) {
-                                for (int offset = 4 + ((n_ubatch / n_swa) * n_swa); offset > 4; offset -= n_swa) {
-                                    if (should_checkpoint_tail(offset)) {
-                                        should_break = true;
-                                        break;
-                                    }
+                                if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
+                                    should_break = true;
+                                    break;
                                 }
                             }
-
-                            if (!should_break && should_checkpoint_tail(4)) {
-                                should_break = true;
-                            }
-
                             if (should_break) {
                                 break;
                             }
@@ -3013,7 +3008,11 @@ private:
                                         __func__, ckpt.pos_min, ckpt.pos_max, ckpt.size(), ckpt.size(), n);
                             }
 
-                            llama_memory_seq_rm(llama_get_memory(slot.ctx), slot.id, ckpt.pos_max + 1, -1);
+                            if (slot.ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+                                if (!llama_memory_seq_rm(llama_get_memory(slot.ctx), slot.id, ckpt.pos_max + 1, -1)) {
+                                    SRV_WRN("%s", "the target context does not support partial sequence removal\n");
+                                }
+                            }
 
                             slot.prompt.tokens.keep_first(ckpt.n_tokens);
                             slot.smpl = std::move(smpl_save);
@@ -3047,7 +3046,9 @@ private:
                 slot.sampled = ids.back(); // last accepted token
                 SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-                llama_memory_seq_rm(llama_get_memory(slot.ctx), slot.id, slot.prompt.n_tokens(), -1);
+                if (slot.ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+                    llama_memory_seq_rm(llama_get_memory(slot.ctx), slot.id, slot.prompt.n_tokens(), -1);
+                }
 
                 for (size_t i = 0; i < ids.size(); ++i) {
                     completion_token_output result;

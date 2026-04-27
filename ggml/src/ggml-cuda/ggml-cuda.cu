@@ -22,6 +22,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
+#include "ggml-cuda/dsv4.cuh"
 #include "ggml-cuda/fattn.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -2936,6 +2937,18 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
+            break;
+        case GGML_OP_DSV4_HC_SPLIT_SINKHORN:
+            ggml_cuda_op_dsv4_hc_split_sinkhorn(ctx, dst);
+            break;
+        case GGML_OP_DSV4_HC_EXPAND:
+            ggml_cuda_op_dsv4_hc_expand(ctx, dst);
+            break;
+        case GGML_OP_DSV4_FP8_KV_QUANTIZE:
+            ggml_cuda_op_dsv4_fp8_kv_quantize(ctx, dst);
+            break;
+        case GGML_OP_DSV4_ROPE_TAIL:
+            ggml_cuda_op_dsv4_rope_tail(ctx, dst);
             break;
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
             ggml_cuda_cross_entropy_loss_back(ctx, dst);
