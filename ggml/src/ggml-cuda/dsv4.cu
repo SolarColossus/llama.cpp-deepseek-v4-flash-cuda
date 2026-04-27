@@ -520,13 +520,11 @@ bool ggml_cuda_op_dsv4_rope_tail_supported(void) {
 }
 
 bool ggml_cuda_op_dsv4_hc_split_sinkhorn_supported(void) {
-    // Placeholder - kernel not yet implemented
-    return false;
+    return true;
 }
 
 bool ggml_cuda_op_dsv4_hc_expand_supported(void) {
-    // Placeholder - kernel not yet implemented
-    return false;
+    return true;
 }
 
 bool ggml_cuda_op_dsv4_fp8_kv_quantize_supported(void) {
