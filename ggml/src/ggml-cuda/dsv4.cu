@@ -285,8 +285,6 @@ static __global__ void kernel_dsv4_hc_split_sinkhorn(
         const float z = mix[off] * post_scale + base[off];
         out[off] = 2.0f / (1.0f + expf(-z));
     }
-    __syncwarp();
-
     // Shared memory c matrix for this warp
     float * c = smem + warp * DSV4_HC_MAX * DSV4_HC_MAX;
 
@@ -303,7 +301,7 @@ static __global__ void kernel_dsv4_hc_split_sinkhorn(
         // Warp-level max reduction
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
-            row_max = fmaxf(row_max, __shfl_down_sync(0xFFFFFFFF, row_max, offset));
+            row_max = fmaxf(row_max, __shfl_down_sync(0xFFFFFFFF, row_max, offset, WARP_SIZE));
         }
 
         float row_sum = 0.0f;
@@ -316,7 +314,7 @@ static __global__ void kernel_dsv4_hc_split_sinkhorn(
         // Warp-level sum reduction
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
-            row_sum += __shfl_down_sync(0xFFFFFFFF, row_sum, offset);
+            row_sum += __shfl_down_sync(0xFFFFFFFF, row_sum, offset, WARP_SIZE);
         }
 
         const float inv_sum = 1.0f / row_sum;
@@ -325,7 +323,6 @@ static __global__ void kernel_dsv4_hc_split_sinkhorn(
             c[idx] = c[idx] * inv_sum + epsv;
         }
     }
-    __syncwarp();
 
     // Normalize over src_hc (each lane handles a subset of dst_hc)
     for (int src_hc = 0; src_hc < HC; ++src_hc) {
@@ -335,7 +332,7 @@ static __global__ void kernel_dsv4_hc_split_sinkhorn(
         }
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
-            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
         }
 
         const float inv_denom = 1.0f / (sum + epsv);
@@ -343,7 +340,6 @@ static __global__ void kernel_dsv4_hc_split_sinkhorn(
             c[src_hc + dst_hc * HC] *= inv_denom;
         }
     }
-    __syncwarp();
 
     // Sinkhorn iterations
     for (int iter = 1; iter < args.sinkhorn_iters; ++iter) {
@@ -355,7 +351,7 @@ static __global__ void kernel_dsv4_hc_split_sinkhorn(
             }
             #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1) {
-                sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+                sum += __shfl_down_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
             }
 
             const float inv_denom = 1.0f / (sum + epsv);
@@ -363,7 +359,6 @@ static __global__ void kernel_dsv4_hc_split_sinkhorn(
                 c[src_hc + dst_hc * HC] *= inv_denom;
             }
         }
-        __syncwarp();
 
         // Normalize over src_hc
         for (int src_hc = 0; src_hc < HC; ++src_hc) {
@@ -373,7 +368,7 @@ static __global__ void kernel_dsv4_hc_split_sinkhorn(
             }
             #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1) {
-                sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+                sum += __shfl_down_sync(0xFFFFFFFF, sum, offset, WARP_SIZE);
             }
 
             const float inv_denom = 1.0f / (sum + epsv);
@@ -381,7 +376,6 @@ static __global__ void kernel_dsv4_hc_split_sinkhorn(
                 c[src_hc + dst_hc * HC] *= inv_denom;
             }
         }
-        __syncwarp();
     }
 
     // Write back c matrix
