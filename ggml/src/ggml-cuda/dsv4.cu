@@ -22,34 +22,16 @@ static __device__ __forceinline__ float dsv4_e4m3fn_value(int i) {
 
 static __device__ __forceinline__ float dsv4_e4m3fn_dequant(float x) {
     const float sign = x < 0.0f ? -1.0f : 1.0f;
-    const float ax   = min(abs(x), 448.0f);
+    const float ax = min(abs(x), 448.0f);
 
-    // Binary search over the monotonically increasing E4M3FN values.
-    // Values are indexed 1..126 (0 is zero, 127 is NaN and unused here).
-    int lo = 1;
-    int hi = 126;
-    while (lo < hi) {
-        int mid = (lo + hi + 1) >> 1;
-        if (dsv4_e4m3fn_value(mid) <= ax) {
-            lo = mid;
-        } else {
-            hi = mid - 1;
-        }
-    }
-
-    const float lo_val = dsv4_e4m3fn_value(lo);
-    const float lo_diff = fabsf(ax - lo_val);
-
-    int best = lo;
-    float best_diff = lo_diff;
-
-    // Check neighbor above (if it exists and is closer)
-    if (lo < 126) {
-        const float hi_val = dsv4_e4m3fn_value(lo + 1);
-        const float hi_diff = fabsf(ax - hi_val);
-        if (hi_diff < best_diff || (hi_diff == best_diff && ((lo + 1) & 1) == 0 && (best & 1) != 0)) {
-            best = lo + 1;
-            best_diff = hi_diff;
+    int best = 0;
+    float best_diff = ax;
+    for (int i = 1; i < 127; ++i) {
+        const float val = dsv4_e4m3fn_value(i);
+        const float diff = fabsf(ax - val);
+        if (diff < best_diff || (diff == best_diff && (i & 1) == 0 && (best & 1) != 0)) {
+            best = i;
+            best_diff = diff;
         }
     }
 
@@ -172,16 +154,8 @@ static __global__ void kernel_dsv4_hc_split_sinkhorn(
         const float * scale,
         const float * base,
         float * dst) {
-    extern __shared__ float smem[];
-    // Layout: [warps_per_block * DSV4_HC_MAX * DSV4_HC_MAX] for c matrices
-    // One warp (32 threads) processes one row to avoid register pressure.
-
-    const int lane = threadIdx.x & 31;
-    const int warp = threadIdx.x >> 5;
-    const int warps_per_block = blockDim.x >> 5;
-
-    const int row = blockIdx.x * warps_per_block + warp;
-    if ((int64_t) row >= args.n_rows) {
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if ((int64_t) tid >= args.n_rows) {
         return;
     }
 
@@ -190,119 +164,91 @@ static __global__ void kernel_dsv4_hc_split_sinkhorn(
         return;
     }
 
-    const float * mix = mixes + ((int64_t) row) * args.mix_hc;
-    float * out = dst + ((int64_t) row) * args.mix_hc;
+    const float * mix = mixes + ((int64_t) tid) * args.mix_hc;
+    float * out = dst + ((int64_t) tid) * args.mix_hc;
 
     const float epsv       = args.eps;
     const float pre_scale  = scale[0];
     const float post_scale = scale[1];
     const float comb_scale = scale[2];
 
-    // Compute pre and post scales collaboratively (all HC sizes use warp parallelism)
-    for (int i = lane; i < HC; i += 32) {
+    for (int i = 0; i < HC; ++i) {
         const float z = mix[i] * pre_scale + base[i];
         out[i] = 1.0f / (1.0f + expf(-z)) + epsv;
     }
-    for (int i = lane; i < HC; i += 32) {
+
+    for (int i = 0; i < HC; ++i) {
         const int off = HC + i;
         const float z = mix[off] * post_scale + base[off];
         out[off] = 2.0f / (1.0f + expf(-z));
     }
-    // Shared memory c matrix for this warp
-    float * c = smem + warp * DSV4_HC_MAX * DSV4_HC_MAX;
 
-    // Softmax over dst_hc rows (each lane handles a subset of src_hc)
+    float c[DSV4_HC_MAX * DSV4_HC_MAX];
+
     for (int dst_hc = 0; dst_hc < HC; ++dst_hc) {
         float row_max = -INFINITY;
-        for (int src_hc = lane; src_hc < HC; src_hc += 32) {
+        for (int src_hc = 0; src_hc < HC; ++src_hc) {
             const int idx = src_hc + dst_hc * HC;
             const int off = 2 * HC + idx;
             const float v = mix[off] * comb_scale + base[off];
             c[idx] = v;
             row_max = fmaxf(row_max, v);
         }
-        // Warp-level max reduction
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            row_max = fmaxf(row_max, __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, row_max, offset, 32));
-        }
 
         float row_sum = 0.0f;
-        for (int src_hc = lane; src_hc < HC; src_hc += 32) {
+        for (int src_hc = 0; src_hc < HC; ++src_hc) {
             const int idx = src_hc + dst_hc * HC;
             const float v = expf(c[idx] - row_max);
             c[idx] = v;
             row_sum += v;
         }
-        // Warp-level sum reduction
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            row_sum += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, row_sum, offset, 32);
-        }
 
         const float inv_sum = 1.0f / row_sum;
-        for (int src_hc = lane; src_hc < HC; src_hc += 32) {
+        for (int src_hc = 0; src_hc < HC; ++src_hc) {
             const int idx = src_hc + dst_hc * HC;
             c[idx] = c[idx] * inv_sum + epsv;
         }
     }
 
-    // Normalize over src_hc (each lane handles a subset of dst_hc)
     for (int src_hc = 0; src_hc < HC; ++src_hc) {
         float sum = 0.0f;
-        for (int dst_hc = lane; dst_hc < HC; dst_hc += 32) {
+        for (int dst_hc = 0; dst_hc < HC; ++dst_hc) {
             sum += c[src_hc + dst_hc * HC];
-        }
-        #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            sum += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, sum, offset, 32);
         }
 
         const float inv_denom = 1.0f / (sum + epsv);
-        for (int dst_hc = lane; dst_hc < HC; dst_hc += 32) {
+        for (int dst_hc = 0; dst_hc < HC; ++dst_hc) {
             c[src_hc + dst_hc * HC] *= inv_denom;
         }
     }
 
-    // Sinkhorn iterations
     for (int iter = 1; iter < args.sinkhorn_iters; ++iter) {
-        // Normalize over dst_hc
         for (int dst_hc = 0; dst_hc < HC; ++dst_hc) {
             float sum = 0.0f;
-            for (int src_hc = lane; src_hc < HC; src_hc += 32) {
+            for (int src_hc = 0; src_hc < HC; ++src_hc) {
                 sum += c[src_hc + dst_hc * HC];
-            }
-            #pragma unroll
-            for (int offset = 16; offset > 0; offset >>= 1) {
-                sum += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, sum, offset, 32);
             }
 
             const float inv_denom = 1.0f / (sum + epsv);
-            for (int src_hc = lane; src_hc < HC; src_hc += 32) {
+            for (int src_hc = 0; src_hc < HC; ++src_hc) {
                 c[src_hc + dst_hc * HC] *= inv_denom;
             }
         }
 
-        // Normalize over src_hc
         for (int src_hc = 0; src_hc < HC; ++src_hc) {
             float sum = 0.0f;
-            for (int dst_hc = lane; dst_hc < HC; dst_hc += 32) {
+            for (int dst_hc = 0; dst_hc < HC; ++dst_hc) {
                 sum += c[src_hc + dst_hc * HC];
-            }
-            #pragma unroll
-            for (int offset = 16; offset > 0; offset >>= 1) {
-                sum += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, sum, offset, 32);
             }
 
             const float inv_denom = 1.0f / (sum + epsv);
-            for (int dst_hc = lane; dst_hc < HC; dst_hc += 32) {
+            for (int dst_hc = 0; dst_hc < HC; ++dst_hc) {
                 c[src_hc + dst_hc * HC] *= inv_denom;
             }
         }
     }
 
-    // Write back c matrix
-    for (int i = lane; i < HC * HC; i += 32) {
+    for (int i = 0; i < HC * HC; ++i) {
         out[2 * HC + i] = c[i];
     }
 }
@@ -497,7 +443,7 @@ static __global__ void kernel_dsv4_fp8_kv_quantize(
         __syncthreads();
     }
 
-    for (int64_t i = n_nope + tid; i < args.ne00; i += blockDim.x) {
+    for (int64_t i = n_nope + tid; i < args.ne00; i += 64) {
         *((float *) (dst_base + i * args.nb0)) = *((const float *) (src_base + i * args.nb00));
     }
 }
@@ -620,11 +566,8 @@ bool ggml_cuda_op_dsv4_hc_split_sinkhorn(ggml_backend_cuda_context & ctx, ggml_t
     const float * base_d  = (const float *) src2->data;
     float * dst_d = (float *) dst->data;
 
-    // Use 32 threads per row (1 warp) to maximize parallelism and avoid register spills.
-    const int threads_per_row = 32;
-    const int rows_per_block = 8;
-    const int nth = threads_per_row * rows_per_block; // 256
-    const int n_tg = (n_rows + rows_per_block - 1) / rows_per_block;
+    const int nth = std::min<int64_t>(256, std::max<int64_t>(1, n_rows));
+    const int n_tg = (n_rows + nth - 1) / nth;
 
     ggml_cuda_kargs_dsv4_hc_split_sinkhorn args = {
         /*.n_hc            =*/ n_hc,
@@ -637,9 +580,8 @@ bool ggml_cuda_op_dsv4_hc_split_sinkhorn(ggml_backend_cuda_context & ctx, ggml_t
     };
 
     const cudaStream_t stream = ctx.stream();
-    const size_t smem_size = rows_per_block * DSV4_HC_MAX * DSV4_HC_MAX * sizeof(float);
 
-    kernel_dsv4_hc_split_sinkhorn<<<n_tg, nth, smem_size, stream>>>(args, mixes_d, scale_d, base_d, dst_d);
+    kernel_dsv4_hc_split_sinkhorn<<<n_tg, nth, 0, stream>>>(args, mixes_d, scale_d, base_d, dst_d);
 
     return true;
 }
@@ -662,11 +604,8 @@ bool ggml_cuda_op_dsv4_hc_expand(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int64_t n_elem = ne0 * ne1 * ne2;
 
-    const int nth = 256;
-    // For large n_hc, each warp (32 threads) processes 1 element
-    const int n_tg = ne1 > 32
-        ? (int)((n_elem + 7) / 8)   // 8 warps * 1 elem/warp = 8 elem/block
-        : (int)((n_elem + nth - 1) / nth);
+    const int nth = std::min<int64_t>(256, std::max<int64_t>(1, n_elem));
+    const int n_tg = (n_elem + nth - 1) / nth;
 
     ggml_cuda_kargs_dsv4_hc_expand args = {
         /*.n_embd    =*/ ne0,
@@ -851,11 +790,8 @@ bool ggml_cuda_op_dsv4_hc_weighted_sum(ggml_backend_cuda_context & ctx, ggml_ten
 
     const int64_t n_elem = n_embd * n_tokens;
 
-    const int nth = 256;
-    // For large n_hc, each warp (32 threads) processes 1 element
-    const int n_tg = x->ne[1] > 32
-        ? (int)((n_elem + 7) / 8)   // 8 warps * 1 elem/warp = 8 elem/block
-        : (int)((n_elem + nth - 1) / nth);
+    const int nth = std::min<int64_t>(256, std::max<int64_t>(1, n_elem));
+    const int n_tg = (n_elem + nth - 1) / nth;
 
     ggml_cuda_kargs_dsv4_hc_weighted_sum args = {
         /*.n_embd   =*/ n_embd,
