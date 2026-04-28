@@ -198,84 +198,7 @@ static __global__ void kernel_dsv4_hc_split_sinkhorn(
     const float post_scale = scale[1];
     const float comb_scale = scale[2];
 
-    // For very small HC, sequential per-thread is faster and avoids warp-sync overhead.
-    if (HC <= 4) {
-        // For tiny HC, just do everything sequentially in lane 0.
-        // The result is small enough that collaborative execution is overhead.
-        if (lane == 0) {
-            float c[DSV4_HC_MAX * DSV4_HC_MAX];
-
-            for (int i = 0; i < HC; ++i) {
-                const float z = mix[i] * pre_scale + base[i];
-                out[i] = 1.0f / (1.0f + expf(-z)) + epsv;
-            }
-            for (int i = 0; i < HC; ++i) {
-                const int off = HC + i;
-                const float z = mix[off] * post_scale + base[off];
-                out[off] = 2.0f / (1.0f + expf(-z));
-            }
-
-            for (int dst_hc = 0; dst_hc < HC; ++dst_hc) {
-                float row_max = -INFINITY;
-                for (int src_hc = 0; src_hc < HC; ++src_hc) {
-                    const int idx = src_hc + dst_hc * HC;
-                    const int off = 2 * HC + idx;
-                    c[idx] = mix[off] * comb_scale + base[off];
-                    row_max = fmaxf(row_max, c[idx]);
-                }
-                float row_sum = 0.0f;
-                for (int src_hc = 0; src_hc < HC; ++src_hc) {
-                    c[src_hc + dst_hc * HC] = expf(c[src_hc + dst_hc * HC] - row_max);
-                    row_sum += c[src_hc + dst_hc * HC];
-                }
-                const float inv_sum = 1.0f / row_sum;
-                for (int src_hc = 0; src_hc < HC; ++src_hc) {
-                    c[src_hc + dst_hc * HC] = c[src_hc + dst_hc * HC] * inv_sum + epsv;
-                }
-            }
-
-            for (int src_hc = 0; src_hc < HC; ++src_hc) {
-                float sum = 0.0f;
-                for (int dst_hc = 0; dst_hc < HC; ++dst_hc) {
-                    sum += c[src_hc + dst_hc * HC];
-                }
-                const float inv_denom = 1.0f / (sum + epsv);
-                for (int dst_hc = 0; dst_hc < HC; ++dst_hc) {
-                    c[src_hc + dst_hc * HC] *= inv_denom;
-                }
-            }
-
-            for (int iter = 1; iter < args.sinkhorn_iters; ++iter) {
-                for (int dst_hc = 0; dst_hc < HC; ++dst_hc) {
-                    float sum = 0.0f;
-                    for (int src_hc = 0; src_hc < HC; ++src_hc) {
-                        sum += c[src_hc + dst_hc * HC];
-                    }
-                    const float inv_denom = 1.0f / (sum + epsv);
-                    for (int src_hc = 0; src_hc < HC; ++src_hc) {
-                        c[src_hc + dst_hc * HC] *= inv_denom;
-                    }
-                }
-                for (int src_hc = 0; src_hc < HC; ++src_hc) {
-                    float sum = 0.0f;
-                    for (int dst_hc = 0; dst_hc < HC; ++dst_hc) {
-                        sum += c[src_hc + dst_hc * HC];
-                    }
-                    const float inv_denom = 1.0f / (sum + epsv);
-                    for (int dst_hc = 0; dst_hc < HC; ++dst_hc) {
-                        c[src_hc + dst_hc * HC] *= inv_denom;
-                    }
-                }
-            }
-
-            for (int i = 0; i < HC * HC; ++i) {
-                out[2 * HC + i] = c[i];
-            }
-        }
-        return;
-    }
-
-    // Compute pre and post scales collaboratively
+    // Compute pre and post scales collaboratively (all HC sizes use warp parallelism)
     for (int i = lane; i < HC; i += 32) {
         const float z = mix[i] * pre_scale + base[i];
         out[i] = 1.0f / (1.0f + expf(-z)) + epsv;
@@ -301,7 +224,7 @@ static __global__ void kernel_dsv4_hc_split_sinkhorn(
         // Warp-level max reduction
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
-            row_max = fmaxf(row_max, __shfl_down_sync(0xFFFFFFFFFFFFFFFF, row_max, offset, 32));
+            row_max = fmaxf(row_max, __shfl_down_sync(0xFFFFFFFFu, row_max, offset, 32));
         }
 
         float row_sum = 0.0f;
@@ -314,7 +237,7 @@ static __global__ void kernel_dsv4_hc_split_sinkhorn(
         // Warp-level sum reduction
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
-            row_sum += __shfl_down_sync(0xFFFFFFFFFFFFFFFF, row_sum, offset, 32);
+            row_sum += __shfl_down_sync(0xFFFFFFFFu, row_sum, offset, 32);
         }
 
         const float inv_sum = 1.0f / row_sum;
@@ -332,7 +255,7 @@ static __global__ void kernel_dsv4_hc_split_sinkhorn(
         }
         #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
-            sum += __shfl_down_sync(0xFFFFFFFFFFFFFFFF, sum, offset, 32);
+            sum += __shfl_down_sync(0xFFFFFFFFu, sum, offset, 32);
         }
 
         const float inv_denom = 1.0f / (sum + epsv);
@@ -351,7 +274,7 @@ static __global__ void kernel_dsv4_hc_split_sinkhorn(
             }
             #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1) {
-                sum += __shfl_down_sync(0xFFFFFFFFFFFFFFFF, sum, offset, 32);
+                sum += __shfl_down_sync(0xFFFFFFFFu, sum, offset, 32);
             }
 
             const float inv_denom = 1.0f / (sum + epsv);
@@ -368,7 +291,7 @@ static __global__ void kernel_dsv4_hc_split_sinkhorn(
             }
             #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1) {
-                sum += __shfl_down_sync(0xFFFFFFFFFFFFFFFF, sum, offset, 32);
+                sum += __shfl_down_sync(0xFFFFFFFFu, sum, offset, 32);
             }
 
             const float inv_denom = 1.0f / (sum + epsv);
@@ -392,27 +315,62 @@ static __global__ void kernel_dsv4_hc_expand(
         const char * comb,
         char * dst) {
     const int64_t n_elem = args.n_embd * args.n_hc * args.n_tokens;
-    const int gid = blockIdx.x * blockDim.x + threadIdx.x;
-    if ((int64_t) gid >= n_elem) {
-        return;
+
+    // For large n_hc, use warp-parallel reduction (1 warp per output element)
+    // For small n_hc, use 1 thread per output element
+    if (args.n_hc > 32) {
+        const int lane = threadIdx.x & 31;
+        const int warp = threadIdx.x >> 5;
+        const int warps_per_block = blockDim.x >> 5;
+        const int elem_id = blockIdx.x * warps_per_block + warp;
+        if ((int64_t) elem_id >= n_elem) {
+            return;
+        }
+
+        const int64_t d      = ((int64_t) elem_id) % args.n_embd;
+        const int64_t tmp    = ((int64_t) elem_id) / args.n_embd;
+        const int64_t dst_hc = tmp % args.n_hc;
+        const int64_t t      = tmp / args.n_hc;
+
+        const float block_v = *((const float *) (block_out + d * args.nb_block0 + t * args.nb_block1));
+        const float post_v  = *((const float *) (post      + dst_hc * args.nb_post0 + t * args.nb_post1));
+
+        float acc = block_v * post_v;
+        for (int64_t src_hc = lane; src_hc < args.n_hc; src_hc += 32) {
+            const float comb_v = *((const float *) (comb     + dst_hc * args.nb_comb0 + src_hc * args.nb_comb1 + t * args.nb_comb2));
+            const float res_v  = *((const float *) (residual + d       * args.nb_res0  + src_hc * args.nb_res1  + t * args.nb_res2));
+            acc += comb_v * res_v;
+        }
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            acc += __shfl_down_sync(0xFFFFFFFFu, acc, offset, 32);
+        }
+        if (lane == 0) {
+            *((float *) (dst + d * args.nb0 + dst_hc * args.nb1 + t * args.nb2)) = acc;
+        }
+    } else {
+        const int gid = blockIdx.x * blockDim.x + threadIdx.x;
+        if ((int64_t) gid >= n_elem) {
+            return;
+        }
+
+        const int64_t d      = ((int64_t) gid) % args.n_embd;
+        const int64_t tmp    = ((int64_t) gid) / args.n_embd;
+        const int64_t dst_hc = tmp % args.n_hc;
+        const int64_t t      = tmp / args.n_hc;
+
+        const float block_v = *((const float *) (block_out + d * args.nb_block0 + t * args.nb_block1));
+        const float post_v  = *((const float *) (post      + dst_hc * args.nb_post0 + t * args.nb_post1));
+
+        float acc = block_v * post_v;
+        for (int64_t src_hc = 0; src_hc < args.n_hc; ++src_hc) {
+            const float comb_v = *((const float *) (comb     + dst_hc * args.nb_comb0 + src_hc * args.nb_comb1 + t * args.nb_comb2));
+            const float res_v  = *((const float *) (residual + d       * args.nb_res0  + src_hc * args.nb_res1  + t * args.nb_res2));
+            acc += comb_v * res_v;
+        }
+
+        *((float *) (dst + d * args.nb0 + dst_hc * args.nb1 + t * args.nb2)) = acc;
     }
-
-    const int64_t d      = ((int64_t) gid) % args.n_embd;
-    const int64_t tmp    = ((int64_t) gid) / args.n_embd;
-    const int64_t dst_hc = tmp % args.n_hc;
-    const int64_t t      = tmp / args.n_hc;
-
-    const float block_v = *((const float *) (block_out + d * args.nb_block0 + t * args.nb_block1));
-    const float post_v  = *((const float *) (post      + dst_hc * args.nb_post0 + t * args.nb_post1));
-
-    float acc = block_v * post_v;
-    for (int64_t src_hc = 0; src_hc < args.n_hc; ++src_hc) {
-        const float comb_v = *((const float *) (comb     + dst_hc * args.nb_comb0 + src_hc * args.nb_comb1 + t * args.nb_comb2));
-        const float res_v  = *((const float *) (residual + d       * args.nb_res0  + src_hc * args.nb_res1  + t * args.nb_res2));
-        acc += comb_v * res_v;
-    }
-
-    *((float *) (dst + d * args.nb0 + dst_hc * args.nb1 + t * args.nb2)) = acc;
 }
 
 static __global__ void kernel_dsv4_hc_weighted_sum(
@@ -421,29 +379,59 @@ static __global__ void kernel_dsv4_hc_weighted_sum(
         const char * weights,
         char * dst) {
     const int64_t n_elem = args.n_embd * args.n_tokens;
-    const int gid = blockIdx.x * blockDim.x + threadIdx.x;
-    if ((int64_t) gid >= n_elem) {
-        return;
+
+    // For large n_hc, use warp-parallel reduction (1 warp per output element)
+    if (args.n_hc > 32) {
+        const int lane = threadIdx.x & 31;
+        const int warp = threadIdx.x >> 5;
+        const int warps_per_block = blockDim.x >> 5;
+        const int elem_id = blockIdx.x * warps_per_block + warp;
+        if ((int64_t) elem_id >= n_elem) {
+            return;
+        }
+
+        const int64_t d = ((int64_t) elem_id) % args.n_embd;
+        const int64_t t = ((int64_t) elem_id) / args.n_embd;
+
+        float acc = 0.0f;
+        for (int64_t h = lane; h < args.n_hc; h += 32) {
+            const float xv = *((const float *) (x       + d * args.nb_x0 + h * args.nb_x1 + t * args.nb_x2));
+            const float wv = *((const float *) (weights + h * args.nb_w0 + t * args.nb_w1));
+            acc += xv * wv;
+        }
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            acc += __shfl_down_sync(0xFFFFFFFFu, acc, offset, 32);
+        }
+        if (lane == 0) {
+            *((float *) (dst + d * args.nb0 + t * args.nb1)) = acc;
+        }
+    } else {
+        const int gid = blockIdx.x * blockDim.x + threadIdx.x;
+        if ((int64_t) gid >= n_elem) {
+            return;
+        }
+
+        const int64_t d = ((int64_t) gid) % args.n_embd;
+        const int64_t t = ((int64_t) gid) / args.n_embd;
+
+        float acc = 0.0f;
+        for (int64_t h = 0; h < args.n_hc; ++h) {
+            const float xv = *((const float *) (x       + d * args.nb_x0 + h * args.nb_x1 + t * args.nb_x2));
+            const float wv = *((const float *) (weights + h * args.nb_w0 + t * args.nb_w1));
+            acc += xv * wv;
+        }
+
+        *((float *) (dst + d * args.nb0 + t * args.nb1)) = acc;
     }
-
-    const int64_t d = ((int64_t) gid) % args.n_embd;
-    const int64_t t = ((int64_t) gid) / args.n_embd;
-
-    float acc = 0.0f;
-    for (int64_t h = 0; h < args.n_hc; ++h) {
-        const float xv = *((const float *) (x       + d * args.nb_x0 + h * args.nb_x1 + t * args.nb_x2));
-        const float wv = *((const float *) (weights + h * args.nb_w0 + t * args.nb_w1));
-        acc += xv * wv;
-    }
-
-    *((float *) (dst + d * args.nb0 + t * args.nb1)) = acc;
 }
 
 static __global__ void kernel_dsv4_fp8_kv_quantize(
         const ggml_cuda_kargs_dsv4_fp8_kv_quantize args,
         const char * src0,
         char * dst) {
-    __shared__ float scratch[64];
+    // Use warp shuffles for faster reduction instead of shared memory loop.
+    // Block size is 128 for better SM occupancy.
 
     const int64_t n_rows = args.ne01 * args.ne02 * args.ne03;
     const int row = blockIdx.x;
@@ -452,6 +440,8 @@ static __global__ void kernel_dsv4_fp8_kv_quantize(
     }
 
     const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
 
     const int64_t i1 = row % args.ne01;
     const int64_t i2 = (row / args.ne01) % args.ne02;
@@ -462,24 +452,45 @@ static __global__ void kernel_dsv4_fp8_kv_quantize(
 
     const int64_t n_nope = args.ne00 - args.n_rot;
 
-    for (int64_t off = 0; off < n_nope; off += 64) {
+    // Process 128 elements per iteration for better throughput
+    for (int64_t off = 0; off < n_nope; off += 128) {
         float v = 0.0f;
-        if (tid < 64) {
+        float local_max = 0.0f;
+        if (off + tid < n_nope) {
             v = *((const float *) (src_base + (off + tid) * args.nb00));
-            scratch[tid] = fabsf(v);
+            local_max = fabsf(v);
+        }
+
+        // Warp-level max reduction
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            local_max = fmaxf(local_max, __shfl_down_sync(0xFFFFFFFFu, local_max, offset, 32));
+        }
+
+        // Broadcast max across warp
+        local_max = __shfl_sync(0xFFFFFFFFu, local_max, 0, 32);
+
+        // Reduce across warps using shared memory
+        __shared__ float warp_max[4];
+        if (lane == 0) {
+            warp_max[warp] = local_max;
         }
         __syncthreads();
 
-        for (uint32_t stride = 32; stride > 0; stride >>= 1) {
-            if (tid < stride) {
-                scratch[tid] = fmaxf(scratch[tid], scratch[tid + stride]);
+        float amax = 0.0f;
+        if (tid == 0) {
+            amax = warp_max[0];
+            for (int w = 1; w < (int)(blockDim.x >> 5); ++w) {
+                amax = fmaxf(amax, warp_max[w]);
             }
-            __syncthreads();
+            warp_max[0] = amax;
         }
+        __syncthreads();
+        amax = warp_max[0];
+        amax = fmaxf(amax, 1.0e-4f);
 
-        const float amax = fmaxf(scratch[0], 1.0e-4f);
         const float scale = exp2f(ceilf(log2f(amax / 448.0f)));
-        if (tid < 64) {
+        if (off + tid < n_nope) {
             const float q = dsv4_e4m3fn_dequant(fminf(fmaxf(v / scale, -448.0f), 448.0f)) * scale;
             *((float *) (dst_base + (off + tid) * args.nb0)) = q;
         }
@@ -535,7 +546,7 @@ static __global__ void kernel_dsv4_rope_tail_f32(
 
             const int ic = r;
             const int rel_i0 = 2 * ic;
-            const float theta = theta_base * powf(args.freq_base, inv_ndims * rel_i0);
+            const float theta = theta_base * exp2f(inv_ndims * rel_i0 * log2f(args.freq_base));
             const float freq_factor = args.src2 ? ((const float *) src2)[ic] : 1.0f;
 
             float cos_theta;
@@ -558,7 +569,7 @@ static __global__ void kernel_dsv4_rope_tail_f32(
             }
 
             const int ic = r / 2;
-            const float theta = theta_base * powf(args.freq_base, inv_ndims * r);
+            const float theta = theta_base * exp2f(inv_ndims * r * log2f(args.freq_base));
             const float freq_factor = args.src2 ? ((const float *) src2)[ic] : 1.0f;
 
             float cos_theta;
@@ -652,7 +663,10 @@ bool ggml_cuda_op_dsv4_hc_expand(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int64_t n_elem = ne0 * ne1 * ne2;
 
     const int nth = 256;
-    const int n_tg = (n_elem + nth - 1) / nth;
+    // For large n_hc, each warp (32 threads) processes 1 element
+    const int n_tg = ne1 > 32
+        ? (int)((n_elem + 7) / 8)   // 8 warps * 1 elem/warp = 8 elem/block
+        : (int)((n_elem + nth - 1) / nth);
 
     ggml_cuda_kargs_dsv4_hc_expand args = {
         /*.n_embd    =*/ ne0,
@@ -737,7 +751,7 @@ bool ggml_cuda_op_dsv4_fp8_kv_quantize(ggml_backend_cuda_context & ctx, ggml_ten
 
     const cudaStream_t stream = ctx.stream();
 
-    kernel_dsv4_fp8_kv_quantize<<<n_rows, 64, 0, stream>>>(
+    kernel_dsv4_fp8_kv_quantize<<<n_rows, 128, 0, stream>>>(
         args,
         (const char *) src0->data,
         (char *) dst->data);
@@ -838,7 +852,10 @@ bool ggml_cuda_op_dsv4_hc_weighted_sum(ggml_backend_cuda_context & ctx, ggml_ten
     const int64_t n_elem = n_embd * n_tokens;
 
     const int nth = 256;
-    const int n_tg = (n_elem + nth - 1) / nth;
+    // For large n_hc, each warp (32 threads) processes 1 element
+    const int n_tg = x->ne[1] > 32
+        ? (int)((n_elem + 7) / 8)   // 8 warps * 1 elem/warp = 8 elem/block
+        : (int)((n_elem + nth - 1) / nth);
 
     ggml_cuda_kargs_dsv4_hc_weighted_sum args = {
         /*.n_embd   =*/ n_embd,
