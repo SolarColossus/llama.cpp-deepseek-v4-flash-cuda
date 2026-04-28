@@ -811,11 +811,20 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
     GGML_UNUSED(buft);
 }
 
+static size_t ggml_backend_cuda_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    // On some systems (e.g. AMD APUs with HIP), a single hipMalloc can fail
+    // for very large contiguous blocks even when total free memory is sufficient.
+    // Cap single allocations to force the allocator to split large models
+    // into multiple smaller buffers.
+    return 1ull << 32; // 4 GiB
+}
+
 static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface = {
     /* .get_name         = */ ggml_backend_cuda_buffer_type_get_name,
     /* .alloc_buffer     = */ ggml_backend_cuda_buffer_type_alloc_buffer,
     /* .get_alignment    = */ ggml_backend_cuda_buffer_type_get_alignment,
-    /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
+    /* .get_max_size     = */ ggml_backend_cuda_buffer_type_get_max_size,
     /* .get_alloc_size   = */ ggml_backend_cuda_buffer_type_get_alloc_size,
     /* .is_host          = */ NULL,
 };
