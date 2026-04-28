@@ -3123,15 +3123,6 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             continue;
         }
 
-        // DSV4 ops are simple kernel launches and fully compatible with CUDA graphs
-        if (node->op == GGML_OP_DSV4_HC_SPLIT_SINKHORN ||
-            node->op == GGML_OP_DSV4_HC_WEIGHTED_SUM ||
-            node->op == GGML_OP_DSV4_HC_EXPAND ||
-            node->op == GGML_OP_DSV4_FP8_KV_QUANTIZE ||
-            node->op == GGML_OP_DSV4_ROPE_TAIL) {
-            continue;
-        }
-
         if (node->src[0] && node->src[0]->buffer && ggml_backend_buft_is_cuda_split(node->src[0]->buffer->buft)) {
             use_cuda_graph = false; // Split buffers are not supported by CUDA graph capture
 #ifndef NDEBUG
