@@ -446,9 +446,9 @@ static __global__ void kernel_dsv4_fp8_kv_quantize(
         local_max = __shfl_sync((unsigned int)0xFFFFFFFF, local_max, 0, WS);
 
         // Reduce across warps using shared memory
-        // Max warps per block: 256 threads / 32 warp size = 8 warps (NVIDIA)
-        // or 256 / 64 = 4 warps (AMD). Use 8 to cover both cases.
-        __shared__ float warp_max[8];
+        // Max warps per block: 1024 threads / 32 warp size = 32 warps (NVIDIA)
+        // or 1024 / 64 = 16 warps (AMD). Use 32 to cover both cases.
+        __shared__ float warp_max[32];
         if (lane == 0) {
             warp_max[warp] = local_max;
         }
@@ -598,9 +598,9 @@ bool ggml_cuda_op_dsv4_hc_split_sinkhorn(ggml_backend_cuda_context & ctx, ggml_t
     const float * base_d  = (const float *) src2->data;
     float * dst_d = (float *) dst->data;
 
-    // Use larger block sizes for better occupancy on modern GPUs
-    // AMD (64-wide wavefronts): 256 threads = 4 warps, NVIDIA (32-wide): 256 threads = 8 warps
-    const int nth = std::max<int64_t>(256, std::min<int64_t>(1024, n_rows));
+    // AMD Strix Halo (RDNA4): 64-wide wavefronts, 512 threads = 8 warps/block
+    // Increase minimum to 512 for better CU occupancy on AMD
+    const int nth = std::max<int64_t>(512, std::min<int64_t>(2048, n_rows));
     const int n_tg = (n_rows + nth - 1) / nth;
 
     ggml_cuda_kargs_dsv4_hc_split_sinkhorn args = {
@@ -638,9 +638,9 @@ bool ggml_cuda_op_dsv4_hc_expand(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int64_t n_elem = ne0 * ne1 * ne2;
 
-    // Use larger block sizes for better occupancy: 256 threads minimum
-    // Ensures good utilization on both NVIDIA (8 warps/block) and AMD (4 warps/block)
-    const int nth = std::max<int64_t>(256, std::min<int64_t>(1024, n_elem));
+    // AMD Strix Halo (RDNA4): 64-wide wavefronts, 512 threads = 8 warps/block
+    // Increase for better CU occupancy on AMD
+    const int nth = std::max<int64_t>(512, std::min<int64_t>(2048, n_elem));
     const int n_tg = (n_elem + nth - 1) / nth;
 
     ggml_cuda_kargs_dsv4_hc_expand args = {
@@ -726,9 +726,9 @@ bool ggml_cuda_op_dsv4_fp8_kv_quantize(ggml_backend_cuda_context & ctx, ggml_ten
 
     const cudaStream_t stream = ctx.stream();
 
-    // Use 256 threads per block for better AMD occupancy (4 warps) vs NVIDIA (8 warps)
-    // For very large n_rows, this gives good parallelism; for small, it still saturates the GPU
-    const int block_size = std::min<int64_t>(256, std::max<int64_t>(128, n_rows));
+    // AMD Strix Halo (RDNA4): 64-wide wavefronts, 512 threads = 8 warps/block
+    // Higher block size improves occupancy for this memory-bound quantization kernel
+    const int block_size = std::min<int64_t>(1024, std::max<int64_t>(512, n_rows));
     kernel_dsv4_fp8_kv_quantize<<<n_rows, block_size, 0, stream>>>(
         args,
         (const char *) src0->data,
@@ -770,9 +770,9 @@ bool ggml_cuda_op_dsv4_rope_tail(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int64_t ne02 = src0->ne[2];
     const int64_t ne03 = src0->ne[3];
 
-    // Use at least 256 threads for better throughput on both NVIDIA and AMD GPUs
-    // For head dims < 256, threads iterate over remaining elements
-    const int nth = std::max<int64_t>(256, std::min<int64_t>(512, ne00));
+    // AMD Strix Halo (RDNA4): 64-wide wavefronts, 512 threads = 8 warps/block
+    // For RoPE, increase minimum to 512 for better throughput on larger head dims
+    const int nth = std::max<int64_t>(512, std::min<int64_t>(1024, ne00));
 
     ggml_cuda_kargs_dsv4_rope_tail args = {
         /*.ne00        =*/ ne00,
@@ -831,9 +831,9 @@ bool ggml_cuda_op_dsv4_hc_weighted_sum(ggml_backend_cuda_context & ctx, ggml_ten
 
     const int64_t n_elem = n_embd * n_tokens;
 
-    // Use larger block sizes for better occupancy: 256 threads minimum
-    // Ensures good utilization on both NVIDIA (8 warps/block) and AMD (4 warps/block)
-    const int nth = std::max<int64_t>(256, std::min<int64_t>(1024, n_elem));
+    // AMD Strix Halo (RDNA4): 64-wide wavefronts, 512 threads = 8 warps/block
+    // Increase for better CU occupancy on AMD
+    const int nth = std::max<int64_t>(512, std::min<int64_t>(2048, n_elem));
     const int n_tg = (n_elem + nth - 1) / nth;
 
     ggml_cuda_kargs_dsv4_hc_weighted_sum args = {
