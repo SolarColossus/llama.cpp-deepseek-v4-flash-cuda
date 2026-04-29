@@ -1305,8 +1305,29 @@ llm_build_deepseek4::llm_build_deepseek4(const llama_model & model, const llm_gr
                 }
             }
 
-            ggml_tensor * attn_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, attn_mask, GGML_TYPE_F16) : attn_mask;
-            cur = build_attn_mha(q, k_all, v_all, nullptr, attn_mask_cnv, layer.attn_sinks, nullptr, kq_scale, il);
+            // FlashAttention requires: K/V type must match, and memory strides must be 16-byte aligned.
+            // DSV4 KV cache is F32 (from FP8 dequantize), so we cast to F16 for FlashAttention.
+            // Also ensure mask is contiguous to avoid stride alignment issues.
+            ggml_tensor * k_fa = k_all;
+            ggml_tensor * v_fa = v_all;
+            if (cparams.flash_attn && k_all->type == GGML_TYPE_F32) {
+                k_fa = ggml_cast(ctx0, k_all, GGML_TYPE_F16);
+                v_fa = k_fa; // v_all == k_all in DSV4
+            }
+            // Ensure mask is contiguous for FlashAttention stride requirements
+            ggml_tensor * attn_mask_fa = attn_mask;
+            if (cparams.flash_attn && attn_mask && attn_mask->type != GGML_TYPE_F16) {
+                attn_mask_fa = ggml_cont(ctx0, ggml_cast(ctx0, attn_mask, GGML_TYPE_F16));
+            }
+            ggml_tensor * attn_mask_cnv = cparams.flash_attn ? attn_mask_fa : attn_mask;
+
+            // Diagnostic: print mask and K tensor info if FlashAttention fails
+            if (cparams.flash_attn) {
+                fprintf(stderr, "[DSV4 FA] n_tokens=%ld k_type=%d mask_type=%d mask_ne2=%ld nb0=%zu nb1=%zu nb2=%zu\n",
+                    (long)n_tokens, k_all->type, attn_mask->type, attn_mask->ne[2],
+                    attn_mask->nb[0], attn_mask->nb[1], attn_mask->nb[2]);
+            }
+            cur = build_attn_mha(q, k_fa, v_fa, nullptr, attn_mask_cnv, layer.attn_sinks, nullptr, kq_scale, il);
             cb(cur, "kqv_out", il);
         }
         cur = ggml_reshape_3d(ctx0, cur, n_embd_head_v, n_head, n_tokens);
