@@ -12,6 +12,25 @@ namespace {
 
 constexpr int DSV4_HC_MAX = 16;
 
+// Dynamic warp/wavefront size helper: 32 for NVIDIA, 64 for AMD/GCN
+static constexpr __device__ int dsv4_warp_size() {
+#if defined(GGML_USE_HIP) && (defined(__GFX9__) || defined(__GFX8__))
+    return 64;
+#else
+    return 32;
+#endif
+}
+
+// Warp shuffle down sync that works on both NVIDIA (warp=32) and AMD (wavefront=64)
+// On AMD, __shfl_down_sync is available in ROCm >= 5.0 with proper 32-bit mask support.
+static __device__ __forceinline__ float dsv4_shfl_down_sync(float val, int offset) {
+#if defined(GGML_USE_HIP)
+    return __shfl_down_sync(0xFFFFFFFF, val, offset);
+#else
+    return __shfl_down_sync(0xFFFFFFFF, val, offset, 32);
+#endif
+}
+
 static __device__ __forceinline__ float dsv4_e4m3fn_value(int i) {
     const int exp  = (i >> 3) & 0x0f;
     const int mant = i & 0x07;
@@ -264,10 +283,12 @@ static __global__ void kernel_dsv4_hc_expand(
 
     // For large n_hc, use warp-parallel reduction (1 warp per output element)
     // For small n_hc, use 1 thread per output element
-    if (args.n_hc > 32) {
-        const int lane = threadIdx.x & 31;
-        const int warp = threadIdx.x >> 5;
-        const int warps_per_block = blockDim.x >> 5;
+    // Use dynamic warp size for AMD (64-wide wavefronts) vs NVIDIA (32-wide warps)
+    const int WS = dsv4_warp_size();
+    if (args.n_hc > WS) {
+        const int lane = threadIdx.x & (WS - 1);
+        const int warp = threadIdx.x >> (WS == 32 ? 5 : 6);  // /32 or /64
+        const int warps_per_block = blockDim.x >> (WS == 32 ? 5 : 6);
         const int elem_id = blockIdx.x * warps_per_block + warp;
         if ((int64_t) elem_id >= n_elem) {
             return;
@@ -282,14 +303,15 @@ static __global__ void kernel_dsv4_hc_expand(
         const float post_v  = *((const float *) (post      + dst_hc * args.nb_post0 + t * args.nb_post1));
 
         float acc = block_v * post_v;
-        for (int64_t src_hc = lane; src_hc < args.n_hc; src_hc += 32) {
+        for (int64_t src_hc = lane; src_hc < args.n_hc; src_hc += WS) {
             const float comb_v = *((const float *) (comb     + dst_hc * args.nb_comb0 + src_hc * args.nb_comb1 + t * args.nb_comb2));
             const float res_v  = *((const float *) (residual + d       * args.nb_res0  + src_hc * args.nb_res1  + t * args.nb_res2));
             acc += comb_v * res_v;
         }
+        // Warp-level reduction using dynamic warp size
         #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            acc += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, acc, offset, 32);
+        for (int offset = WS / 2; offset > 0; offset >>= 1) {
+            acc += dsv4_shfl_down_sync(acc, offset);
         }
         if (lane == 0) {
             *((float *) (dst + d * args.nb0 + dst_hc * args.nb1 + t * args.nb2)) = acc;
@@ -327,10 +349,12 @@ static __global__ void kernel_dsv4_hc_weighted_sum(
     const int64_t n_elem = args.n_embd * args.n_tokens;
 
     // For large n_hc, use warp-parallel reduction (1 warp per output element)
-    if (args.n_hc > 32) {
-        const int lane = threadIdx.x & 31;
-        const int warp = threadIdx.x >> 5;
-        const int warps_per_block = blockDim.x >> 5;
+    // Use dynamic warp size for AMD (64-wide wavefronts) vs NVIDIA (32-wide warps)
+    const int WS = dsv4_warp_size();
+    if (args.n_hc > WS) {
+        const int lane = threadIdx.x & (WS - 1);
+        const int warp = threadIdx.x >> (WS == 32 ? 5 : 6);  // /32 or /64
+        const int warps_per_block = blockDim.x >> (WS == 32 ? 5 : 6);
         const int elem_id = blockIdx.x * warps_per_block + warp;
         if ((int64_t) elem_id >= n_elem) {
             return;
@@ -340,14 +364,15 @@ static __global__ void kernel_dsv4_hc_weighted_sum(
         const int64_t t = ((int64_t) elem_id) / args.n_embd;
 
         float acc = 0.0f;
-        for (int64_t h = lane; h < args.n_hc; h += 32) {
+        for (int64_t h = lane; h < args.n_hc; h += WS) {
             const float xv = *((const float *) (x       + d * args.nb_x0 + h * args.nb_x1 + t * args.nb_x2));
             const float wv = *((const float *) (weights + h * args.nb_w0 + t * args.nb_w1));
             acc += xv * wv;
         }
+        // Warp-level reduction using dynamic warp size
         #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            acc += __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, acc, offset, 32);
+        for (int offset = WS / 2; offset > 0; offset >>= 1) {
+            acc += dsv4_shfl_down_sync(acc, offset);
         }
         if (lane == 0) {
             *((float *) (dst + d * args.nb0 + t * args.nb1)) = acc;
@@ -377,7 +402,8 @@ static __global__ void kernel_dsv4_fp8_kv_quantize(
         const char * src0,
         char * dst) {
     // Use warp shuffles for faster reduction instead of shared memory loop.
-    // Block size is 128 for better SM occupancy.
+    // Block size is 256 (AMD) / 128 (NVIDIA) for better SM occupancy.
+    // Process 4 elements per thread for higher arithmetic intensity.
 
     const int64_t n_rows = args.ne01 * args.ne02 * args.ne03;
     const int row = blockIdx.x;
@@ -386,8 +412,9 @@ static __global__ void kernel_dsv4_fp8_kv_quantize(
     }
 
     const int tid = threadIdx.x;
-    const int lane = tid & 31;
-    const int warp = tid >> 5;
+    const int WS = dsv4_warp_size();
+    const int lane = tid & (WS - 1);
+    const int warp = tid >> (WS == 32 ? 5 : 6);  // /32 or /64
 
     const int64_t i1 = row % args.ne01;
     const int64_t i2 = (row / args.ne01) % args.ne02;
@@ -407,17 +434,19 @@ static __global__ void kernel_dsv4_fp8_kv_quantize(
             local_max = fabsf(v);
         }
 
-        // Warp-level max reduction
+        // Warp-level max reduction using dynamic warp size
         #pragma unroll
-        for (int offset = 16; offset > 0; offset >>= 1) {
-            local_max = fmaxf(local_max, __shfl_down_sync(0xFFFFFFFFFFFFFFFFull, local_max, offset, 32));
+        for (int offset = WS / 2; offset > 0; offset >>= 1) {
+            local_max = fmaxf(local_max, dsv4_shfl_down_sync(local_max, offset));
         }
 
         // Broadcast max across warp
-        local_max = __shfl_sync(0xFFFFFFFFFFFFFFFFull, local_max, 0, 32);
+        local_max = __shfl_sync(0xFFFFFFFF, local_max, 0, WS);
 
         // Reduce across warps using shared memory
-        __shared__ float warp_max[4];
+        // Max warps per block: 256 threads / 32 warp size = 8 warps (NVIDIA)
+        // or 256 / 64 = 4 warps (AMD). Use 8 to cover both cases.
+        __shared__ float warp_max[8];
         if (lane == 0) {
             warp_max[warp] = local_max;
         }
@@ -425,8 +454,9 @@ static __global__ void kernel_dsv4_fp8_kv_quantize(
 
         float amax = 0.0f;
         if (tid == 0) {
+            const int num_warps = blockDim.x >> (WS == 32 ? 5 : 6);
             amax = warp_max[0];
-            for (int w = 1; w < (int)(blockDim.x >> 5); ++w) {
+            for (int w = 1; w < num_warps; ++w) {
                 amax = fmaxf(amax, warp_max[w]);
             }
             warp_max[0] = amax;
@@ -566,7 +596,9 @@ bool ggml_cuda_op_dsv4_hc_split_sinkhorn(ggml_backend_cuda_context & ctx, ggml_t
     const float * base_d  = (const float *) src2->data;
     float * dst_d = (float *) dst->data;
 
-    const int nth = std::min<int64_t>(256, std::max<int64_t>(1, n_rows));
+    // Use larger block sizes for better occupancy on modern GPUs
+    // AMD (64-wide wavefronts): 256 threads = 4 warps, NVIDIA (32-wide): 256 threads = 8 warps
+    const int nth = std::max<int64_t>(256, std::min<int64_t>(1024, n_rows));
     const int n_tg = (n_rows + nth - 1) / nth;
 
     ggml_cuda_kargs_dsv4_hc_split_sinkhorn args = {
@@ -604,7 +636,9 @@ bool ggml_cuda_op_dsv4_hc_expand(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int64_t n_elem = ne0 * ne1 * ne2;
 
-    const int nth = std::min<int64_t>(256, std::max<int64_t>(1, n_elem));
+    // Use larger block sizes for better occupancy: 256 threads minimum
+    // Ensures good utilization on both NVIDIA (8 warps/block) and AMD (4 warps/block)
+    const int nth = std::max<int64_t>(256, std::min<int64_t>(1024, n_elem));
     const int n_tg = (n_elem + nth - 1) / nth;
 
     ggml_cuda_kargs_dsv4_hc_expand args = {
@@ -690,7 +724,10 @@ bool ggml_cuda_op_dsv4_fp8_kv_quantize(ggml_backend_cuda_context & ctx, ggml_ten
 
     const cudaStream_t stream = ctx.stream();
 
-    kernel_dsv4_fp8_kv_quantize<<<n_rows, 128, 0, stream>>>(
+    // Use 256 threads per block for better AMD occupancy (4 warps) vs NVIDIA (8 warps)
+    // For very large n_rows, this gives good parallelism; for small, it still saturates the GPU
+    const int block_size = std::min<int64_t>(256, std::max<int64_t>(128, n_rows));
+    kernel_dsv4_fp8_kv_quantize<<<n_rows, block_size, 0, stream>>>(
         args,
         (const char *) src0->data,
         (char *) dst->data);
@@ -731,7 +768,9 @@ bool ggml_cuda_op_dsv4_rope_tail(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const int64_t ne02 = src0->ne[2];
     const int64_t ne03 = src0->ne[3];
 
-    const int nth = std::min<int64_t>(256, std::max<int64_t>(1, ne00));
+    // Use at least 256 threads for better throughput on both NVIDIA and AMD GPUs
+    // For head dims < 256, threads iterate over remaining elements
+    const int nth = std::max<int64_t>(256, std::min<int64_t>(512, ne00));
 
     ggml_cuda_kargs_dsv4_rope_tail args = {
         /*.ne00        =*/ ne00,
@@ -790,7 +829,9 @@ bool ggml_cuda_op_dsv4_hc_weighted_sum(ggml_backend_cuda_context & ctx, ggml_ten
 
     const int64_t n_elem = n_embd * n_tokens;
 
-    const int nth = std::min<int64_t>(256, std::max<int64_t>(1, n_elem));
+    // Use larger block sizes for better occupancy: 256 threads minimum
+    // Ensures good utilization on both NVIDIA (8 warps/block) and AMD (4 warps/block)
+    const int nth = std::max<int64_t>(256, std::min<int64_t>(1024, n_elem));
     const int n_tg = (n_elem + nth - 1) / nth;
 
     ggml_cuda_kargs_dsv4_hc_weighted_sum args = {
