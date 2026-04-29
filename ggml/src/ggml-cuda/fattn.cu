@@ -507,7 +507,22 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
-    switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
+    const int kernel = ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst);
+    const ggml_tensor * Q = dst->src[0];
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * V = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+    
+    fprintf(stderr, "[FA kernel select] kernel=%d Q_ne=[%ld,%ld,%ld,%ld] K_ne=[%ld,%ld,%ld,%ld] "
+            "K_type=%d V_type=%d mask_ne2=%ld K_nb=[%zu,%zu,%zu,%zu] V_nb=[%zu,%zu,%zu,%zu]\n",
+            kernel,
+            (long)Q->ne[0], (long)Q->ne[1], (long)Q->ne[2], (long)Q->ne[3],
+            (long)K->ne[0], (long)K->ne[1], (long)K->ne[2], (long)K->ne[3],
+            K->type, V->type, mask ? (long)mask->ne[2] : -1,
+            K->nb[0], K->nb[1], K->nb[2], K->nb[3],
+            V->nb[0], V->nb[1], V->nb[2], V->nb[3]);
+    
+    switch (kernel) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
         case BEST_FATTN_KERNEL_TILE:
