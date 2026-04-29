@@ -313,6 +313,7 @@ static __global__ void kernel_dsv4_hc_expand(
         for (int offset = WS / 2; offset > 0; offset >>= 1) {
             acc += dsv4_shfl_down_sync(acc, offset);
         }
+        // Mask 0xFFFFFFFF is 32-bit; cast to avoid 64→32 implicit conversion warning
         if (lane == 0) {
             *((float *) (dst + d * args.nb0 + dst_hc * args.nb1 + t * args.nb2)) = acc;
         }
@@ -374,6 +375,7 @@ static __global__ void kernel_dsv4_hc_weighted_sum(
         for (int offset = WS / 2; offset > 0; offset >>= 1) {
             acc += dsv4_shfl_down_sync(acc, offset);
         }
+        // Mask 0xFFFFFFFF is 32-bit; cast to avoid 64→32 implicit conversion warning
         if (lane == 0) {
             *((float *) (dst + d * args.nb0 + t * args.nb1)) = acc;
         }
@@ -440,8 +442,8 @@ static __global__ void kernel_dsv4_fp8_kv_quantize(
             local_max = fmaxf(local_max, dsv4_shfl_down_sync(local_max, offset));
         }
 
-        // Broadcast max across warp
-        local_max = __shfl_sync(0xFFFFFFFF, local_max, 0, WS);
+        // Broadcast max across warp (0xFFFFFFFF cast to uint32_t for mask)
+        local_max = __shfl_sync((unsigned int)0xFFFFFFFF, local_max, 0, WS);
 
         // Reduce across warps using shared memory
         // Max warps per block: 256 threads / 32 warp size = 8 warps (NVIDIA)
